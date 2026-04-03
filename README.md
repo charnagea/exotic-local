@@ -4,6 +4,8 @@ A standalone local version of NASA JPL's [EXOTIC Standard Colab notebook](https:
 
 Instead of running in Google Colab with Google Drive, this script runs entirely on your own computer — Windows or Mac.
 
+## HOW TO INSTALL AND RUN DEMO VIDEO: https://vimeo.com/1179945668
+
 ---
 
 ## What does this do?
