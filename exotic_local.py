@@ -280,13 +280,46 @@ def fetch_star_chart_image_url(json_url):
     return data["image_uri"].split("?")[0]
 
 
+def _chart_viewer(img_data, vmin, vmax, chart_data, stop_event):
+    """Runs in a separate process with its own matplotlib event loop.
+    Must be at module level so Windows multiprocessing can pickle it."""
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+
+    ncols = 2 if chart_data is not None else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 7))
+    if ncols == 1:
+        axes = [axes]
+
+    axes[0].imshow(img_data, cmap="viridis", vmin=vmin, vmax=vmax,
+                    origin="lower")
+    axes[0].set_title("Your telescope image (hover for coords)")
+
+    if chart_data is not None:
+        axes[1].imshow(chart_data)
+        axes[1].set_title("AAVSO Star Chart")
+        axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.show(block=False)
+
+    # Keep the window alive until the main process signals us to stop
+    while not stop_event.is_set():
+        try:
+            plt.pause(0.2)
+        except Exception:
+            break
+    plt.close("all")
+
+
 def step3_identify_stars(first_image, telescope, star_name,
                          planetary_params, fits_dir, output_dir,
                          aavso_code, sec_code):
     """Show telescope image + AAVSO chart, prompt for target/comp coords,
     then create the inits.json file."""
     from exotic.api.colab import make_inits_file
-    import matplotlib.pyplot as plt
+    import multiprocessing
 
     # ── Fetch AAVSO star chart ──
     print(f"  Fetching AAVSO star chart for '{star_name}' ({telescope})...")
@@ -301,50 +334,49 @@ def step3_identify_stars(first_image, telescope, star_name,
         print(f"  Try manually: {web_url}")
         starchart_image_url = input("  Paste the star chart image URL here (or Enter to skip): ").strip() or None
 
-    # ── Display side-by-side ──
+    # ── Prepare image data for the chart viewer ──
     from astropy.io import fits as afits
-    from astropy.visualization import ImageNormalize, ZScaleInterval
     import numpy as np
 
     with afits.open(first_image) as hdul:
-        img_data = hdul[0].data
+        img_data = hdul[0].data.astype(float)
 
-    norm = ImageNormalize(img_data, interval=ZScaleInterval(),
-                          vmin=np.nanpercentile(img_data, 5),
-                          vmax=np.nanpercentile(img_data, 99))
+    vmin = float(np.nanpercentile(img_data, 5))
+    vmax = float(np.nanpercentile(img_data, 99))
 
-    chart_img = None
+    chart_img_array = None
     if starchart_image_url:
         try:
             import requests
-            resp = requests.get(starchart_image_url, timeout=15)
             from PIL import Image as PILImage
             from io import BytesIO
-            chart_img = PILImage.open(BytesIO(resp.content))
+            resp = requests.get(starchart_image_url, timeout=15)
+            chart_img_array = np.array(PILImage.open(BytesIO(resp.content)))
         except Exception as e:
             print(f"  Could not download chart: {e}")
 
+    # ── Launch / manage the chart viewer ──
+    stop_event = multiprocessing.Event()
+    viewer_proc = None
+
     def show_charts():
-        """Open (or reopen) the side-by-side FITS + AAVSO chart window."""
-        ncols = 2 if chart_img else 1
-        fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 7))
-        if ncols == 1:
-            axes = [axes]
+        nonlocal viewer_proc, stop_event
+        # Kill any existing viewer
+        if viewer_proc is not None and viewer_proc.is_alive():
+            stop_event.set()
+            viewer_proc.join(timeout=3)
+            if viewer_proc.is_alive():
+                viewer_proc.terminate()
+        stop_event = multiprocessing.Event()
+        viewer_proc = multiprocessing.Process(
+            target=_chart_viewer,
+            args=(img_data, vmin, vmax, chart_img_array, stop_event),
+            daemon=True
+        )
+        viewer_proc.start()
 
-        axes[0].imshow(img_data, cmap="viridis", norm=norm, origin="lower")
-        axes[0].set_title("Your telescope image (hover for coords)")
-
-        if chart_img:
-            axes[1].imshow(chart_img)
-            axes[1].set_title("AAVSO Star Chart")
-            axes[1].axis("off")
-
-        plt.tight_layout()
-        plt.show(block=False)
-        plt.pause(0.5)
-
-    print("\n  Displaying your FITS image and the AAVSO star chart side by side.")
-    print("  Hover over the FITS image to read pixel coordinates.")
+    print("\n  Displaying your FITS image and the AAVSO star chart.")
+    print("  The chart window runs independently — click, zoom, pan freely.")
     print('  TIP: Type "star" at any prompt to reopen the chart window.\n')
     show_charts()
 
@@ -372,7 +404,12 @@ def step3_identify_stars(first_image, telescope, star_name,
             break
         print("  Format must be [[x1,y1],[x2,y2]], e.g. [[326,365],[416,343]]  (or type 'star' to reopen charts)")
 
-    plt.close("all")
+    # ── Close the chart viewer ──
+    stop_event.set()
+    if viewer_proc is not None and viewer_proc.is_alive():
+        viewer_proc.join(timeout=3)
+        if viewer_proc.is_alive():
+            viewer_proc.terminate()
 
     # ── Build inits.json ──
     print(f"\n  Target coords: {targ_coords}")
@@ -629,4 +666,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required on Windows for multiprocessing (chart viewer)
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
