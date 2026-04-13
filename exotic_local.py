@@ -485,8 +485,12 @@ def step4_run_exotic(inits_file_path):
     result = subprocess.run(cmd, shell=True)
 
     if result.returncode != 0:
-        print(f"\n  WARNING: EXOTIC exited with code {result.returncode}")
-        print(f"  Re-run manually to debug:\n    {cmd}\n")
+        print(f"\n  ERROR: EXOTIC exited with code {result.returncode}")
+        print(f"\n  This is usually caused by a temporary AAVSO API outage or")
+        print(f"  a problem with the comparison star coordinates.")
+        print(f"\n  You can re-run EXOTIC directly with:")
+        print(f"    {cmd}")
+        return output_dir, planet, date_obs, False
 
     # ── Show results ──
     lightcurve = os.path.join(output_dir, f"FinalLightCurve_{planet}_{date_obs}.png")
@@ -512,7 +516,7 @@ def step4_run_exotic(inits_file_path):
         print(f"\n  WARNING: AAVSO output file not found at {aavso_file}")
 
     print(f"\n  All outputs saved to: {output_dir}\n")
-    return output_dir, planet, date_obs
+    return output_dir, planet, date_obs, True
 
 
 # =====================================================================
@@ -674,6 +678,14 @@ def main():
     if not planet_name:
         planet_name = _prompt("Exoplanet name", example="Qatar-2 b")
 
+    aavso_code = args.aavso
+    if not aavso_code and _INTERACTIVE_SESSION:
+        aavso_code = _sanitize_input(
+            input("AAVSO observer code (or Enter to skip): ")
+        )
+
+    sec_code = args.aavso2
+
     # ── Step 1: discover files ──
     print("\n-- Step 1: Load telescope images --")
     fits_dir, fits_files, inits, first_image, output_dir = step1_load_images(fits_dir)
@@ -709,15 +721,15 @@ def main():
         inits_file_path = step3_identify_stars(
             first_image, args.telescope, star_name,
             planetary_params, fits_dir, output_dir,
-            args.aavso, args.aavso2,
+            aavso_code, sec_code,
         )
 
     # ── Step 4: run EXOTIC ──
     print("\n-- Step 4: Run EXOTIC --")
-    output_dir, planet, date_obs = step4_run_exotic(inits_file_path)
+    output_dir, planet, date_obs, success = step4_run_exotic(inits_file_path)
 
     # ── Step 5: certificate ──
-    if not args.no_certificate:
+    if success and not args.no_certificate:
         print("\n-- Step 5: Participation certificate (optional) --")
         step5_certificate(output_dir, planet_name, args.name)
 
