@@ -35,6 +35,20 @@ from pathlib import Path
 # Helpers
 # =====================================================================
 
+# True when the user double-clicked the script (no CLI args).
+# Used to decide whether to pause before exiting.
+_INTERACTIVE_SESSION = False
+
+
+def wait_and_exit(code=1):
+    """Print a pause prompt so a double-click user can read the error,
+    then exit.  In CLI mode (arguments provided) just exit immediately."""
+    if _INTERACTIVE_SESSION:
+        print()
+        input("Press Enter to close this window...")
+    sys.exit(code)
+
+
 def check_dependencies():
     """Verify that the required packages are installed."""
     missing = []
@@ -55,7 +69,7 @@ def check_dependencies():
     if missing:
         print("Missing packages — install with:")
         print(f"  pip install {' '.join(missing)}")
-        sys.exit(1)
+        wait_and_exit(1)
 
 
 def find_fits_files(directory):
@@ -122,12 +136,12 @@ def step1_load_images(fits_dir):
     fits_dir = os.path.abspath(fits_dir)
     if not os.path.isdir(fits_dir):
         print(f"ERROR: Directory not found: {fits_dir}")
-        sys.exit(1)
+        wait_and_exit(1)
 
     fits_files = find_fits_files(fits_dir)
     if not fits_files:
         print(f"ERROR: No .fits/.fit/.fits.gz files found in {fits_dir}")
-        sys.exit(1)
+        wait_and_exit(1)
 
     inits = find_inits_files(fits_dir)
     first_image = os.path.join(fits_dir, fits_files[0])
@@ -148,24 +162,43 @@ def step1_load_images(fits_dir):
 # =====================================================================
 
 def step2_planetary_params(planet_name):
-    """Query the NASA Exoplanet Archive for planet parameters."""
+    """Query the NASA Exoplanet Archive for planet parameters.
+    If running interactively, allows the user to retry with a corrected name."""
     from exotic.exotic import NASAExoplanetArchive
     from exotic.api.colab import fix_planetary_params
 
-    targ = NASAExoplanetArchive(planet=planet_name)
-    resolved_name = targ.planet_info()[0]
+    attempt = planet_name
+    while True:
+        try:
+            targ = NASAExoplanetArchive(planet=attempt)
+            resolved_name = targ.planet_info()[0]
 
-    if not targ.resolve_name():
-        print(f"ERROR: Could not find '{planet_name}' in the NASA Exoplanet Archive.")
-        print("  Check spelling/spacing at https://exoplanetarchive.ipac.caltech.edu/")
-        sys.exit(1)
+            if not targ.resolve_name():
+                raise ValueError(f"'{attempt}' not found")
 
-    print(f"  Found: {resolved_name}")
-    p_param_string = targ.planet_info(fancy=True)
-    p_param_dict = json.loads(p_param_string)
-    planetary_params = fix_planetary_params(p_param_dict)
-    print(f"  Planetary parameters loaded.\n")
-    return planetary_params, resolved_name
+            print(f"  Found: {resolved_name}")
+            p_param_string = targ.planet_info(fancy=True)
+            p_param_dict = json.loads(p_param_string)
+            planetary_params = fix_planetary_params(p_param_dict)
+            print(f"  Planetary parameters loaded.\n")
+            return planetary_params, resolved_name, resolved_name
+
+        except Exception as exc:
+            print(f"\n  ERROR: Could not find '{attempt}' in the NASA Exoplanet Archive.")
+            print(f"         ({type(exc).__name__}: {exc})")
+            print("  Check spelling/spacing at https://exoplanetarchive.ipac.caltech.edu/")
+            print("  Examples: HAT-P-36 b, WASP-39 b, Qatar-2 b")
+            print("  Note: the trailing letter (b, c, d…) is required.\n")
+
+            if _INTERACTIVE_SESSION:
+                retry = input("  Enter a corrected planet name (or press Enter to quit): ").strip()
+                retry = _sanitize_input(retry) if retry else ""
+                if not retry:
+                    wait_and_exit(1)
+                print(f"  Retrying with: '{retry}'...")
+                attempt = retry
+            else:
+                wait_and_exit(1)
 
 
 # =====================================================================
@@ -590,27 +623,56 @@ Examples:
     return parser.parse_args()
 
 
+def _sanitize_input(raw):
+    """Strip surrounding quotes, whitespace, and normalise the value.
+    Handles the common mistake of pasting paths/names with extra quotes,
+    e.g.  "Qatar-2 b"  →  Qatar-2 b
+    """
+    s = raw.strip()
+    # Remove matched outer quotes (single or double)
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+    return s
+
+
+def _prompt(label, example=None, allow_empty=False):
+    """Prompt the user for input with sanitisation and retry on empty."""
+    hint = f" (e.g. {example})" if example else ""
+    while True:
+        raw = input(f"{label}{hint}: ")
+        value = _sanitize_input(raw)
+        if value or allow_empty:
+            return value
+        print("  ERROR: Input cannot be empty. Please try again.")
+
+
 def main():
+    global _INTERACTIVE_SESSION
     args = parse_args()
+
+    # Detect if the user launched interactively (double-click / no args)
+    _INTERACTIVE_SESSION = (
+        args.fits_dir is None
+        and args.planet is None
+        and args.star is None
+        and not args.aavso
+    )
+
     check_dependencies()
 
     print("=" * 60)
     print("  EXOTIC Standard — Local Edition")
     print("=" * 60)
 
-    # ── Gather inputs ──
+    # ── Gather inputs (with sanitisation) ──
     fits_dir = args.fits_dir
     if not fits_dir:
-        fits_dir = input("\nPath to FITS images folder: ").strip()
+        fits_dir = _prompt("\nPath to FITS images folder",
+                           example=r"C:\Users\You\EXOTIC\fits")
 
     planet_name = args.planet
     if not planet_name:
-        planet_name = input("Exoplanet name (e.g. 'Qatar-2 b'): ").strip()
-
-    star_name = args.star
-    if not star_name:
-        star_name = re.sub(r"\s+[a-zA-Z]$", "", planet_name).strip()
-    print(f"  Host star: {star_name}")
+        planet_name = _prompt("Exoplanet name", example="Qatar-2 b")
 
     # ── Step 1: discover files ──
     print("\n-- Step 1: Load telescope images --")
@@ -633,17 +695,17 @@ def main():
     if inits_file_path is None:
         # ── Step 2: get planetary params ──
         print("\n-- Step 2: Download planetary parameters --")
-        planetary_params, resolved_name = step2_planetary_params(planet_name)
+        planetary_params, resolved_name, planet_name = step2_planetary_params(planet_name)
 
-        # ── Step 2b: optional image cleaning ──
-        if not args.no_clean:
-            do_clean = input("Review images to remove bad ones? [y/N]: ").strip().lower()
-            if do_clean == "y":
-                fits_files = step2b_clean_images(fits_dir, fits_files)
-                first_image = os.path.join(fits_dir, fits_files[0])
+        # Derive star name from the (possibly corrected) planet name
+        star_name = args.star
+        if not star_name:
+            star_name = re.sub(r"\s+[a-zA-Z]$", "", planet_name).strip()
+        print(f"  Host star: {star_name}")
 
         # ── Step 3: star identification ──
-        print("\n-- Step 3: Identify target & comparison stars --")
+        print(f"\n-- Step 3: Identify target & comparison stars --")
+        print(f"  Planet: {planet_name}  |  Star: {star_name}")
         inits_file_path = step3_identify_stars(
             first_image, args.telescope, star_name,
             planetary_params, fits_dir, output_dir,
@@ -664,9 +726,30 @@ def main():
     print(f"    {output_dir}")
     print("=" * 60)
 
+    if _INTERACTIVE_SESSION:
+        print()
+        input("Press Enter to close this window...")
+
 
 if __name__ == "__main__":
     # Required on Windows for multiprocessing (chart viewer)
     import multiprocessing
     multiprocessing.freeze_support()
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  Cancelled by user.")
+        if _INTERACTIVE_SESSION:
+            input("Press Enter to close this window...")
+        sys.exit(0)
+    except Exception as exc:
+        print("\n" + "=" * 60)
+        print("  UNEXPECTED ERROR — please report this to Andrei")
+        print("=" * 60)
+        print(f"\n  {type(exc).__name__}: {exc}\n")
+        import traceback
+        traceback.print_exc()
+        if _INTERACTIVE_SESSION:
+            print()
+            input("Press Enter to close this window...")
+        sys.exit(1)
